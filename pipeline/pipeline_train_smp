@@ -1,0 +1,510 @@
+# %%
+import sys, os, json
+
+import numpy as np
+from segmentation_models_pytorch.base.modules import Activation
+import skimage.io as io
+
+import matplotlib.pyplot as plt
+import matplotlib
+
+from PIL import Image
+import cv2
+
+from torch._C import device
+import torch.nn
+
+import segmentation_models_pytorch as smp
+import albumentations as albu
+from torch.nn.modules import activation
+
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as BaseDataset
+
+from operator import itemgetter
+
+
+class Dataset(BaseDataset):
+    """CamVid Dataset. Read images, apply augmentation and preprocessing transformations.
+    
+    Args:
+        images_dir (str): path to images folder
+        masks_dir (str): path to segmentation masks folder
+        class_values (list): values of classes to extract from segmentation mask
+        augmentation (albumentations.Compose): data transfromation pipeline 
+            (e.g. flip, scale, etc.)
+        preprocessing (albumentations.Compose): data preprocessing 
+            (e.g. noralization, shape manipulation, etc.)
+    
+    """
+
+    CLASSES = [1]
+    
+    def __init__(
+            self, 
+            images_dir, 
+            masks_dir, 
+            classes=None, 
+            augmentation=None, 
+            preprocessing=None,
+    ):
+        self.ids = os.listdir(images_dir)
+        self.images_fps = [os.path.join(images_dir, image_id) for image_id in self.ids]
+        self.masks_fps = [os.path.join(masks_dir, image_id) for image_id in self.ids]
+        
+        # convert str names to class values on masks
+        # self.class_values = [self.CLASSES.index(cls.lower()) for cls in classes]
+        # self.class_values = classes
+
+        self.augmentation = augmentation
+        self.preprocessing = preprocessing
+    
+    def __getitem__(self, i):
+        
+        
+        # read data
+        
+        image      = np.array(Image.open(self.images_fps[i]))
+        image      = np.dstack((np.zeros(image.shape), image, np.zeros(image.shape)))
+
+        mask         = np.array(Image.open(self.masks_fps[i]))
+        mask         = np.expand_dims(mask, axis=2).astype('float')
+        
+
+        # extract certain classes from mask (e.g. cars)
+        # masks = [(mask == v) for v in self.class_values]
+        # mask = np.stack(masks, axis=-1).astype('float')
+
+        # apply augmentations
+        if self.augmentation:
+            sample = self.augmentation(image=image, mask=mask)
+            image, mask = sample['image'], sample['mask']
+        
+        # apply preprocessing
+        if self.preprocessing:
+            sample = self.preprocessing(image=image, mask=mask)
+            image, mask = sample['image'], sample['mask']
+        
+        return image, mask
+        
+    def __len__(self):
+        return len(self.ids)
+
+def visualize(count, **images):
+    """PLot images in one row."""
+    n = len(images)
+    plt.figure(figsize=(16, 5))
+    for i, (name, image) in enumerate(images.items()):
+        plt.subplot(1, n, i + 1)
+        plt.xticks([])
+        plt.yticks([])
+        plt.title(' '.join(name.split('_')).title())
+        plt.imshow(image)
+    plt.savefig("output_{}.jpg".format(count))
+
+
+def get_training_augmentation():
+    train_transform = [
+        albu.RandomCrop(height=256, width=256, always_apply=True),
+    ]
+    return albu.Compose(train_transform)
+
+
+def get_validation_augmentation():
+    """Add paddings to make image shape divisible by 32"""
+    test_transform = [
+        albu.PadIfNeeded(256, 256)
+    ]
+    return albu.Compose(test_transform)
+
+
+def to_tensor(x, **kwargs):
+    return x.transpose(2, 0, 1).astype('float32')
+
+
+def get_preprocessing(preprocessing_fn):
+    """Construct preprocessing transform
+    
+    Args:
+        preprocessing_fn (callbale): data normalization function 
+            (can be specific for each pretrained neural network)
+    Return:
+        transform: albumentations.Compose
+    
+    """
+    
+    _transform = [
+        albu.Lambda(image=preprocessing_fn),
+        albu.Lambda(image=to_tensor, mask=to_tensor),
+    ]
+    return albu.Compose(_transform)
+
+def train(encoder : str,
+          encoder_weights : str,
+          classes : list,
+          activation : str,
+          device : str,
+          epochs : int,
+          object_identified : str,
+          data_directory : str,
+          model_directory : str,
+          model_basename  : str,
+          architecture : str):
+
+    preprocessing_fn = smp.encoders.get_preprocessing_fn(encoder, encoder_weights)
+    if classes == None:
+        len_classes = 0
+    else:
+        len_classes = len(classes)
+    
+    if architecture == "UNET":
+        model = smp.Unet(encoder_name=encoder, 
+                        encoder_weights=encoder_weights, 
+                        classes=len_classes, 
+                        activation=activation)
+
+    train_directory = os.path.join(data_directory, "train")
+    x_train_dir     = os.path.join(train_directory, "image")
+    y_train_dir     = os.path.join(train_directory, "groundtruth_borderbinary")
+
+    validation_directory = os.path.join(data_directory, "validation")
+    x_valid_dir          = os.path.join(validation_directory, "image")
+    y_valid_dir          = os.path.join(validation_directory, "groundtruth_borderbinary")
+
+    train_dataset = Dataset(
+        x_train_dir, 
+        y_train_dir, 
+        augmentation=get_training_augmentation(), 
+        preprocessing=get_preprocessing(preprocessing_fn),
+        classes=classes)
+
+    valid_dataset = Dataset(
+        x_valid_dir, 
+        y_valid_dir, 
+        augmentation=get_validation_augmentation(), 
+        preprocessing=get_preprocessing(preprocessing_fn),
+        classes=classes,
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=12)
+    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    loss = smp.utils.losses.DiceLoss(activation=activation)
+
+    metrics = [
+        smp.utils.metrics.IoU(threshold=0.5),
+        smp.utils.metrics.Fscore(threshold=0.5)
+    ]
+
+    optimizer = torch.optim.Adam([ 
+        dict(params=model.parameters(), lr=0.0001),
+    ])
+
+
+    # create epoch runners 
+    # it is a simple loop of iterating over dataloader`s samples
+    train_epoch = smp.utils.train.TrainEpoch(
+        model, 
+        loss=loss, 
+        metrics=metrics, 
+        optimizer=optimizer,
+        device=device,
+        verbose=True,
+    )
+
+    valid_epoch = smp.utils.train.ValidEpoch(
+        model, 
+        loss=loss, 
+        metrics=metrics, 
+        device=device,
+        verbose=True,
+    )
+
+    # train model for 40 epochs
+    max_score = 0
+    
+    train_logs_list, valid_logs_list = [], []
+    i = 0
+    for i in range(epochs):
+        
+        print('\nEpoch: {}'.format(i))
+        train_logs = train_epoch.run(train_loader)
+        valid_logs = valid_epoch.run(valid_loader)
+        
+        train_logs_list.append(train_logs)
+        valid_logs_list.append(valid_logs)
+
+        # do something (save model, change lr, etc.)
+        if max_score < valid_logs['iou_score']:
+            max_score = valid_logs['iou_score']
+            torch.save(model, os.path.join(model_directory, model_basename))
+            print('Model saved!')
+            
+        if i == 25:
+            optimizer.param_groups[0]['lr'] = 1e-5
+            print('Decrease decoder learning rate to 1e-5!')
+    
+    return train_logs_list, valid_logs_list
+
+def plot_histories(train_logs, valid_logs, directory, file_name):
+    
+    fig, axs = plt.subplots(2, 3, figsize=(24, 16), tight_layout=True)
+
+    train_diceloss = []
+    train_iouscore = []
+    train_fscore   = []
+    
+    for train in train_logs:
+        train_diceloss.append(train['dice_loss'])
+        train_iouscore.append(train['iou_score'])
+        train_fscore.append(train['fscore'])
+    
+    axs[0,0].plot(train_diceloss)
+    axs[0,0].set_title("Training Data - Dice Loss")
+    axs[0,0].set_ylabel("Dice Loss")
+    axs[0,1].plot(train_iouscore)
+    axs[0,1].set_title("Training Data - IOU Score")
+    axs[0,1].set_ylabel("IOU Score")
+    axs[0,2].plot(train_fscore)
+    axs[0,2].set_title("Training Data - F Score")
+    axs[0,2].set_ylabel("F Score")
+
+    del train_diceloss
+    del train_iouscore
+    del train_fscore
+
+    valid_diceloss = []
+    valid_iouscore = []
+    valid_fscore = []
+
+    for valid in valid_logs:
+        valid_diceloss.append(valid['dice_loss'])
+        valid_iouscore.append(valid['iou_score'])
+        valid_fscore.append(valid['fscore'])
+        
+    axs[1,0].plot(valid_diceloss)
+    axs[1,0].set_title("Validation Data - Dice Loss")
+    axs[1,0].set_ylabel("Dice Loss")
+    axs[1,1].plot(valid_iouscore)
+    axs[1,1].set_title("Validation Data - IOU Score")
+    axs[1,1].set_ylabel("IOU Score")
+    axs[1,2].plot(valid_fscore)
+    axs[1,2].set_title("Validation Data - F Score")
+    axs[1,2].set_ylabel("F Score")
+
+    del valid_diceloss
+    del valid_iouscore
+    del valid_fscore
+
+    fig.suptitle(file_name[:-4])
+
+    for x in axs.flat:
+        x.set(xlabel='EPOCHS')
+    
+
+    plt.savefig(os.path.join(directory, file_name))
+
+
+def test_loaded_model(model_pathway : str,
+                      data_directory : str,
+                      classes    : list,
+                      device     : str,
+                      activation : str):
+    
+
+    best_model = torch.load(model_pathway)
+    model_name = os.path.basename(model_pathway)
+    model_info = model_name.split("_")
+    encoder    = model_info[1]
+    encoder_weights = model_info[2]
+
+    test_directory = os.path.join(data_directory, "test")
+    x_test_dir     = os.path.join(test_directory, "image")
+    y_test_dir     = os.path.join(test_directory, "groundtruth_borderbinary")
+
+    preprocessing_fn = smp.encoders.get_preprocessing_fn(encoder, encoder_weights)
+
+    # create test dataset
+    test_dataset = Dataset(
+        x_test_dir, 
+        y_test_dir, 
+        augmentation=get_validation_augmentation(), 
+        preprocessing=get_preprocessing(preprocessing_fn),
+        classes=classes,
+    )
+
+    test_dataloader = DataLoader(test_dataset)
+
+    # Dice/F1 score - https://en.wikipedia.org/wiki/S%C3%B8rensen%E2%80%93Dice_coefficient
+    # IoU/Jaccard score - https://en.wikipedia.org/wiki/Jaccard_index
+
+    loss = smp.utils.losses.DiceLoss(activation=activation)
+    metrics = [
+        smp.utils.metrics.IoU(threshold=0.5),
+    ]
+
+    optimizer = torch.optim.Adam([ 
+        dict(params=best_model.parameters(), lr=0.0001),
+    ])
+
+    # evaluate model on test set
+    test_epoch = smp.utils.train.ValidEpoch(
+        model=best_model,
+        loss=loss,
+        metrics=metrics,
+        device=device,
+    )
+
+    logs = test_epoch.run(test_dataloader)
+
+def visualize_output(model_pathway,
+                     data_directory,
+                     classes,
+                     device,
+                     output_dir):
+    
+    best_model = torch.load(model_pathway)
+    model_name = os.path.basename(model_pathway)
+    model_info = model_name.split("_")
+    encoder    = model_info[1]
+    encoder_weights = model_info[2]
+
+    test_directory = os.path.join(data_directory, "test")
+    x_test_dir     = os.path.join(test_directory, "image")
+    y_test_dir     = os.path.join(test_directory, "groundtruth_borderbinary")
+
+    preprocessing_fn = smp.encoders.get_preprocessing_fn(encoder, encoder_weights)
+    
+    # Dataset for visualizing
+    test_dataset_vis = Dataset(x_test_dir, y_test_dir, 
+                           classes=classes)
+
+
+    # create test dataset
+    test_dataset = Dataset(
+        x_test_dir, 
+        y_test_dir, 
+        augmentation=get_validation_augmentation(), 
+        preprocessing=get_preprocessing(preprocessing_fn),
+        classes = classes
+    )
+
+    nums = [1085, 582, 650, 830, 1028]
+    for i in range(5):
+        # n = np.random.choice(len(test_dataset_vis))
+        n = nums[i]
+
+        print(n)
+        image_vis = test_dataset_vis[n][0]
+        image, gt_mask = test_dataset[n]
+
+        gt_mask = gt_mask.squeeze()
+        # print(np.unique(gt_mask))
+        
+        x_tensor = torch.from_numpy(image).to(device).unsqueeze(0)
+        pr_mask = best_model.predict(x_tensor)
+        pr_mask = pr_mask.squeeze().cpu().numpy()
+        pr_mask_shape = pr_mask.shape
+
+        print(np.unique(pr_mask))
+
+        
+        fig, ((ax_img, ax_groundtruth, ax_prediction), (ax_pred0, ax_pred1, ax_pred2))= plt.subplots(2, 3, figsize = (24, 16))
+        ax_img.imshow(image_vis)
+        ax_img.set_title("Image")
+        ax_groundtruth.imshow(gt_mask)
+        ax_groundtruth.set_title("Groundtruth")
+        
+        if len(pr_mask_shape) == 2:
+            ax_prediction.imshow(pr_mask)
+            ax_prediction.set_title("Prediction Channel 0")
+        else:
+            
+            ax_pred0.imshow(pr_mask[0,:,:])
+            ax_pred0.set_title("Prediction Channel 0")
+            if pr_mask_shape[0] > 1:
+                ax_pred1.imshow(pr_mask[1,:,:])
+                ax_pred1.set_title("Prediction Channel 1")
+            if pr_mask_shape[1] > 2:
+                ax_pred2.imshow(pr_mask[2,:,:])
+                ax_pred2.set_title("Prediction Channel 2")
+        
+        fig.suptitle(f"Testing Image {n}")
+        plot_name = os.path.join(output_dir, f"testingimage_{n}")
+        plt.savefig(plot_name)
+
+# %%
+def main():
+
+    object_identified = "cell"
+    ARCHITECTURE = 'UNET'
+    ENCODER = 'resnet50'
+    ENCODER_WEIGHTS = 'imagenet'
+    CLASSES = [1]
+    EPOCHS = 200
+    ACTIVATION = 'sigmoid' # could be None for logits or 'softmax2d' for multiclass segmentation
+    DEVICE = "cuda"
+
+    model_directory    = "/home/vihanimm/SegmentationModelToolkit/workdir/binary_borders/models_2021AUG24"
+    data_basedirectory = "/home/vihanimm/SegmentationModelToolkit/Data/tif_data"
+    file_directory     = os.path.dirname(os.path.abspath(__file__))
+    
+
+    assert os.path.isdir(model_directory), f"{model_directory} is not an existing directory for models"
+    assert os.path.isdir(data_basedirectory), f"{data_basedirectory} is not an existing directory for data"
+    assert os.path.isdir(file_directory), f"{file_directory} is not existing directory for {__file__}"
+    assert os.path.dirname(model_directory) == file_directory, f"Not same location: {model_directory}, {file_directory}"
+
+
+    # output file names
+    output_model_file = '{}_{}_{}_{}_{}.pth'.format(ARCHITECTURE, 
+                                                   ENCODER, 
+                                                   ENCODER_WEIGHTS, 
+                                                   object_identified,
+                                                   ACTIVATION)
+
+    output_train_json = "{}_train.json".format(output_model_file[:-4])
+    output_valid_json = "{}_valid.json".format(output_model_file[:-4])
+
+
+    # parameter that do not need to be updated
+    data_directory = os.path.join(data_basedirectory, object_identified)
+
+    # train the model
+    # train_history, valid_history = train(encoder           = ENCODER,
+    #                                      encoder_weights   = ENCODER_WEIGHTS,
+    #                                      classes           = CLASSES,
+    #                                      activation        = ACTIVATION,
+    #                                      device            = DEVICE,
+    #                                      epochs            = EPOCHS,
+    #                                      object_identified = object_identified,
+    #                                      data_directory    = data_directory,
+    #                                      model_directory   = model_directory,
+    #                                      model_basename    = output_model_file,
+    #                                      architecture      = ARCHITECTURE)
+
+    # json.dump(train_history, open(os.path.join(model_directory, output_train_json), 'w'))
+    # json.dump(valid_history, open(os.path.join(model_directory, output_valid_json), 'w'))
+
+    # output_score_graph = "{}.jpg".format(output_model_file[:-4])
+    # plot_histories(train_logs = train_history, 
+    #                valid_logs = valid_history, 
+    #                directory = model_directory, 
+    #                file_name = output_score_graph)
+
+    model_pathway = os.path.join(model_directory, output_model_file)
+    visualize_output(model_pathway  = model_pathway, 
+                     data_directory = data_directory,
+                     classes        = CLASSES,
+                     device         = DEVICE,
+                     output_dir     = file_directory)
+
+    # test_loaded_model(model_pathway  = model_pathway,
+    #                   data_directory = data_directory,
+    #                   classes        = CLASSES,
+    #                   device         = DEVICE,
+    #                   activation     = ACTIVATION)
+    
+
+main()
+
